@@ -8,7 +8,8 @@ import json
 import os
 
 # 🔑 Replace this with your real bot token from BotFather
-BOT_TOKEN = "8350941550:AAG9wuwKlUtDtFdhRVcdMZhp7mwROsjA3LE"
+import os
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # 📁 File to store reminders
