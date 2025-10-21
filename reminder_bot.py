@@ -103,8 +103,12 @@ def check_reminders():
 # === Robust Parsing with explicit RELATIVE_BASE in IST ===
 def parse_reminder_message(text):
     """
-    Robust parser with explicit handling for 'tomorrow'/'today' and 'in N minutes/hours'.
-    Returns dict with keys: ok, type, task, time (tz-aware IST), frequency (or None), error (if ok=False).
+    Robust parser with preprocessing to normalize phrases like:
+      "tomorrow at 11 am"  -> "at 11 am tomorrow"
+      "tomorrow 11 am"     -> "at 11 am tomorrow"
+      "today 7pm"          -> "at 7pm today"
+    Uses IST RELATIVE_BASE so 'tomorrow'/'today' resolve correctly.
+    Returns dict: ok, type, task, time (tz-aware IST), frequency, error.
     """
     if not text or not text.strip():
         return {"ok": False, "error": "Empty message."}
@@ -112,7 +116,37 @@ def parse_reminder_message(text):
     text_orig = text.strip()
     text_l = text_orig.lower().strip()
 
-    # Use current IST time as the reference base for relative phrases
+    # --- Preprocessing: move leading 'today'/'tomorrow' after the time if needed ---
+    # Examples transformed:
+    # "remind me to check email tomorrow at 11am" -> "remind me to check email at 11am tomorrow"
+    # "remind me tomorrow 11am to check email"     -> "remind me to check email at 11am tomorrow" (we attempt sensible reordering)
+    def normalize_relative_position(s: str) -> str:
+        s2 = s
+
+        # Case 1: "<something> tomorrow at 11am" -> "<something> at 11am tomorrow"
+        s2 = re.sub(r"\b(tomorrow|today)\s+at\s+(\d{1,2}(:\d{2})?\s*(am|pm)?)\b",
+                    r"at \2 \1", s2, flags=re.IGNORECASE)
+
+        # Case 2: "<something> tomorrow 11am" -> "<something> at 11am tomorrow"
+        s2 = re.sub(r"\b(tomorrow|today)\s+(\d{1,2}(:\d{2})?\s*(am|pm)?)\b",
+                    r"at \2 \1", s2, flags=re.IGNORECASE)
+
+        # Case 3: "tomorrow at 11am to check" -> "at 11am tomorrow to check" (leading relative day)
+        s2 = re.sub(r"^(.*\b)(tomorrow|today)\s+at\s+(\d{1,2}(:\d{2})?\s*(am|pm)?)(.*)$",
+                    lambda m: (m.group(1) + "at " + m.group(3) + " " + m.group(2) + m.group(6)) , s2, flags=re.IGNORECASE)
+
+        # Case 4: "tomorrow 11am to check" -> "at 11am tomorrow to check" (leading relative day without preceding words)
+        s2 = re.sub(r"^(.*\b)(tomorrow|today)\s+(\d{1,2}(:\d{2})?\s*(am|pm)?)(.*)$",
+                    lambda m: (m.group(1) + "at " + m.group(3) + " " + m.group(2) + m.group(6)) , s2, flags=re.IGNORECASE)
+
+        # Extra: collapse duplicate spaces
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        return s2
+
+    normalized_text = normalize_relative_position(text_orig)
+    normalized_text_l = normalized_text.lower()
+
+    # Use current IST time as RELATIVE_BASE
     relative_base = datetime.now(IST)
     dp_settings = {
         "PREFER_DATES_FROM": "future",
@@ -121,112 +155,50 @@ def parse_reminder_message(text):
         "RELATIVE_BASE": relative_base
     }
 
-    # Helper: try parsing a time-string, return tz-aware IST datetime or None
+    # Helper: try parsing a time fragment -> tz-aware IST datetime or None
     def try_parse_time_fragment(fragment):
-        # direct parse first
         dt = dateparser.parse(fragment, settings=dp_settings)
         if dt:
             return dt.astimezone(IST)
-        # try search_dates on fragment
         res = search_dates(fragment, settings=dp_settings)
         if res:
             return res[-1][1].astimezone(IST)
         return None
 
-    # 1) Recurring reminders: "remind me every day at 8am to meditate"
-    recurring_match = re.search(r"remind me every (day|daily|week|weekly) at (.+?) to (.+)", text_l)
+    # 1) Recurring: "remind me every day at 8am to meditate"
+    recurring_match = re.search(r"remind me every (day|daily|week|weekly) at (.+?) to (.+)", normalized_text_l)
     if recurring_match:
         freq_raw = recurring_match.group(1)
         frequency = "daily" if "day" in freq_raw or "daily" in freq_raw else "weekly"
         time_text = recurring_match.group(2).strip()
         task = recurring_match.group(3).strip()
-
         dt = try_parse_time_fragment(time_text)
         if not dt:
             return {"ok": False, "error": "😅 I couldn't understand the time in that recurring reminder. Try: 'every day at 8am'."}
         return {"ok": True, "type": "recurring", "task": task, "time": dt, "frequency": frequency}
 
-    # 2) Straight pattern: "remind me to <task> at/in/on <time>"
-    simple_match = re.search(r"remind me to (.+?) (?:at|in|on) (.+)", text_l)
+    # 2) Simple one-time: "remind me to <task> at|in|on <time>"
+    simple_match = re.search(r"remind me to (.+?) (?:at|in|on) (.+)", normalized_text_l)
     if simple_match:
         task = simple_match.group(1).strip()
         time_text = simple_match.group(2).strip()
 
-        # Special handling for "tomorrow" and "today" when dateparser fails
-        if "tomorrow" in time_text or "tomorrow" in text_l:
-            # parse the time part (remove 'tomorrow' to get the clock time, e.g., '11am')
-            time_only = re.sub(r"\btomorrow\b", "", time_text, flags=re.IGNORECASE).strip()
-            # if time_only empty, try parsing from whole text
-            dt_time = try_parse_time_fragment(time_only) if time_only else None
-            if not dt_time:
-                # try to parse time_text as-is
-                dt_time = try_parse_time_fragment(time_text)
-            if not dt_time:
-                # fallback: try to extract hh[:mm] am/pm via regex
-                m = re.search(r"(\d{1,2}(:\d{2})?\s?(am|pm)?)", time_text, flags=re.IGNORECASE)
-                if m:
-                    parsed_clock = dateparser.parse(m.group(1), settings=dp_settings)
-                    if parsed_clock:
-                        dt_time = parsed_clock.astimezone(IST)
-            if not dt_time:
-                return {"ok": False, "error": "😅 I couldn't understand the time (e.g. '11am'). Try: 'tomorrow at 11am' or 'in 2 hours'."}
-            # Build a 'tomorrow' date with parsed clock
-            tomorrow_date = (relative_base + timedelta(days=1)).date()
-            dt = datetime(
-                year=tomorrow_date.year,
-                month=tomorrow_date.month,
-                day=tomorrow_date.day,
-                hour=dt_time.hour,
-                minute=dt_time.minute,
-                tzinfo=IST
-            )
-            return {"ok": True, "type": "one-time", "task": task, "time": dt, "frequency": None}
-
-        # Special handling for "today"
-        if "today" in time_text or "today" in text_l:
-            time_only = re.sub(r"\btoday\b", "", time_text, flags=re.IGNORECASE).strip()
-            dt_time = try_parse_time_fragment(time_only) if time_only else None
-            if not dt_time:
-                dt_time = try_parse_time_fragment(time_text)
-            if not dt_time:
-                return {"ok": False, "error": "😅 I couldn't understand the time (e.g. '11am'). Try: 'today at 11am' or 'in 2 hours'."}
-            today_date = relative_base.date()
-            dt = datetime(
-                year=today_date.year,
-                month=today_date.month,
-                day=today_date.day,
-                hour=dt_time.hour,
-                minute=dt_time.minute,
-                tzinfo=IST
-            )
-            # if this datetime is in the past relative to base, move to next day (user likely meant next occurrence)
-            if dt <= relative_base:
-                dt = dt + timedelta(days=1)
-            return {"ok": True, "type": "one-time", "task": task, "time": dt, "frequency": None}
-
-        # Handling "in N minutes/hours" and other relative phrases — rely on dateparser with RELATIVE_BASE
+        # handle explicit "tomorrow"/"today" after normalization as they should now be after time
         dt = try_parse_time_fragment(time_text)
         if not dt:
-            # as final fallback try search_dates on full original text
-            res = search_dates(text_orig, settings=dp_settings)
+            # fallback: search in whole normalized text
+            res = search_dates(normalized_text, settings=dp_settings)
             if res:
                 dt = res[-1][1].astimezone(IST)
-                # remove date fragment to get task candidate
-                date_text = res[-1][0]
-                task_candidate = re.sub(re.escape(date_text), "", text_orig, flags=re.IGNORECASE).strip()
-                task_candidate = re.sub(r"(?i)remind me( to| that)?", "", task_candidate, flags=re.IGNORECASE).strip()
-                if not task_candidate:
-                    return {"ok": False, "error": "I found the time but couldn't find the task. Try: 'remind me to call mom at 7pm'."}
-                return {"ok": True, "type": "one-time", "task": task_candidate, "time": dt, "frequency": None}
+        if not dt:
             return {"ok": False, "error": "😅 I couldn't understand the time. Try: 'in 10 minutes' or 'at 8 pm'."}
-        # success
         return {"ok": True, "type": "one-time", "task": task, "time": dt, "frequency": None}
 
-    # 3) Flexible fallback using search_dates on whole sentence
-    res = search_dates(text_orig, settings=dp_settings)
+    # 3) Flexible fallback: search whole normalized text
+    res = search_dates(normalized_text, settings=dp_settings)
     if res:
         date_text, dt = res[-1]
-        task_candidate = re.sub(re.escape(date_text), "", text_orig, flags=re.IGNORECASE).strip()
+        task_candidate = re.sub(re.escape(date_text), "", normalized_text, flags=re.IGNORECASE).strip()
         task_candidate = re.sub(r"(?i)remind me( to| that)?", "", task_candidate, flags=re.IGNORECASE).strip()
         if not task_candidate:
             return {"ok": False, "error": "I found the time but not the task. Try: 'remind me to call mom at 7pm'."}
@@ -235,9 +207,8 @@ def parse_reminder_message(text):
         dt = dt.astimezone(IST)
         return {"ok": True, "type": "one-time", "task": task_candidate, "time": dt, "frequency": None}
 
-    # Nothing matched
+    # 4) Nothing found
     return {"ok": False, "error": "I couldn't find a time in your message. Try: 'remind me to call mom at 7pm' or 'remind me in 10 minutes'."}
-
 # === Telegram Handlers ===
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
