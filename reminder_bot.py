@@ -3,8 +3,9 @@ import re
 import time
 import threading
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo  # built-in for Python 3.9+
+from zoneinfo import ZoneInfo  # Python 3.9+
 import dateparser
+from dateparser.search import search_dates
 from supabase import create_client, Client
 import os
 
@@ -22,9 +23,8 @@ bot = telebot.TeleBot(BOT_TOKEN)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# --- Supabase Helper Functions ---
+# === Database Helper Functions ===
 def add_reminder(chat_id, task, remind_time, recurring=False, frequency=None):
-    # Store in UTC for consistency
     utc_time = remind_time.astimezone(UTC)
     supabase.table("reminders").insert({
         "chat_id": chat_id,
@@ -72,6 +72,7 @@ def get_user_reminders_filtered(chat_id, start, end):
     return data.data if data.data else []
 
 
+# === Background Reminder Checker ===
 def check_reminders():
     """Background thread that checks due reminders every 30 seconds"""
     while True:
@@ -97,7 +98,65 @@ def check_reminders():
         time.sleep(30)
 
 
-# --- Telegram Command Handlers ---
+# === Message Parsing ===
+def parse_reminder_message(text):
+    """
+    Returns dict with parsed info or error message
+    """
+    text_orig = text.strip()
+    text_l = text_orig.lower().strip()
+
+    # Recurring reminders: "remind me every day at 8am to meditate"
+    recurring_match = re.search(r"remind me every (day|daily|week|weekly) at (.+?) to (.+)", text_l)
+    if recurring_match:
+        freq_raw = recurring_match.group(1)
+        frequency = "daily" if "day" in freq_raw or "daily" in freq_raw else "weekly"
+        time_text = recurring_match.group(2).strip()
+        task = recurring_match.group(3).strip()
+
+        dt = dateparser.parse(
+            time_text,
+            settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True}
+        )
+        if not dt:
+            return {"ok": False, "error": "😅 I couldn't understand the time in that recurring reminder. Try: 'every day at 8am'."}
+        return {"ok": True, "type": "recurring", "task": task, "time": dt.astimezone(IST), "frequency": frequency}
+
+    # One-time reminders: "remind me to call mom at 8 pm"
+    simple_match = re.search(r"remind me to (.+?) (?:at|in|on) (.+)", text_l)
+    if simple_match:
+        task = simple_match.group(1).strip()
+        time_text = simple_match.group(2).strip()
+
+        dt = dateparser.parse(
+            time_text,
+            settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True}
+        )
+        if not dt:
+            res = search_dates(time_text, settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True})
+            if res:
+                dt = res[-1][1]
+        if not dt:
+            return {"ok": False, "error": "😅 I couldn't understand the time. Try: 'in 10 minutes' or 'at 8 pm'."}
+        return {"ok": True, "type": "one-time", "task": task, "time": dt.astimezone(IST), "frequency": None}
+
+    # Fallback: detect any datetime inside the sentence
+    res = search_dates(text_orig, settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True})
+    if res:
+        date_text, dt = res[-1]
+        task_candidate = re.sub(re.escape(date_text), "", text_orig, flags=re.IGNORECASE).strip()
+        task_candidate = re.sub(r"(?i)remind me( to| that)?", "", task_candidate, flags=re.IGNORECASE).strip()
+        if not task_candidate:
+            return {"ok": False, "error": "I found the time but not the task. Try: 'remind me to call mom at 7pm'."}
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        dt = dt.astimezone(IST)
+        return {"ok": True, "type": "one-time", "task": task_candidate, "time": dt, "frequency": None}
+
+    return {"ok": False, "error": "I couldn't find a time in your message. Try: 'remind me to call mom at 7pm' or 'remind me in 10 minutes'."}
+
+
+# === Telegram Handlers ===
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
     bot.reply_to(message, (
@@ -106,7 +165,7 @@ def send_welcome(message):
         "🕐 `remind me to drink water at 8 pm`\n"
         "🔁 `remind me every day at 8am to meditate`\n\n"
         "Commands:\n"
-        "/list - show all upcoming reminders\n"
+        "/list - show all reminders\n"
         "/list today - show today's reminders\n"
         "/list week - show this week's reminders\n"
         "/delete <id> - delete a reminder by its ID\n\n"
@@ -117,7 +176,6 @@ def send_welcome(message):
 
 @bot.message_handler(commands=["list"])
 def handle_list(message):
-    """Shows upcoming reminders for this user, or filtered ones"""
     chat_id = message.chat.id
     args = message.text.split()
 
@@ -142,7 +200,7 @@ def handle_list(message):
         rid = r["id"]
         task = r["task"]
         t = datetime.fromisoformat(r["remind_time"]).astimezone(IST).strftime("%I:%M %p, %b %d")
-        rec = " (🔁 daily)" if r.get("recurring") else ""
+        rec = f" (🔁 {r['frequency']})" if r.get("recurring") else ""
         lines.append(f"• ID {rid}: {task}{rec} — ⏰ {t} IST")
 
     bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
@@ -150,7 +208,6 @@ def handle_list(message):
 
 @bot.message_handler(commands=["delete"])
 def handle_delete(message):
-    """Deletes a reminder by its ID"""
     parts = message.text.split()
     if len(parts) < 2:
         bot.reply_to(message, "Usage: `/delete <id>`\nExample: `/delete 3`", parse_mode="Markdown")
@@ -166,60 +223,26 @@ def handle_delete(message):
 
 @bot.message_handler(func=lambda msg: True)
 def handle_message(message):
-    """Handles natural language reminder creation"""
-    text = message.text.lower().strip()
+    text = message.text or ""
+    parsed = parse_reminder_message(text)
 
-    # --- Recurring Reminder Pattern ---
-    recurring_match = re.search(r"remind me every (day|week|daily|weekly) at (.+) to (.+)", text)
-    if recurring_match:
-        frequency = "daily" if "day" in recurring_match.group(1) else "weekly"
-        time_text = recurring_match.group(2).strip()
-        task = recurring_match.group(3).strip()
-
-        remind_time = dateparser.parse(
-            time_text,
-            settings={
-                'PREFER_DATES_FROM': 'future',
-                'TIMEZONE': 'Asia/Kolkata',
-                'RETURN_AS_TIMEZONE_AWARE': True
-            }
-        )
-        if not remind_time:
-            bot.reply_to(message, "😅 I couldn't understand the time. Try: 'every day at 8am' or 'every week at 6pm'")
-            return
-
-        remind_time = remind_time.astimezone(IST)
-        add_reminder(message.chat.id, task, remind_time, recurring=True, frequency=frequency)
-        bot.reply_to(message, f"✅ Got it! I'll remind you *{frequency}* to *{task}* at {remind_time.strftime('%I:%M %p')} IST ⏰", parse_mode="Markdown")
+    if not parsed.get("ok"):
+        bot.reply_to(message, parsed.get("error") + "\n\nTry:\n'remind me every day at 8am to meditate'\nor\n'remind me to call mom at 7pm'")
         return
 
-    # --- One-time Reminder Pattern ---
-    match = re.search(r"remind me to (.+) (?:at|in) (.+)", text)
-    if match:
-        task = match.group(1).strip()
-        time_text = match.group(2).strip()
+    if parsed["type"] == "recurring":
+        add_reminder(message.chat.id, parsed["task"], parsed["time"], recurring=True, frequency=parsed["frequency"])
+        bot.reply_to(message, f"✅ Got it! I'll remind you *{parsed['frequency']}* to *{parsed['task']}* at {parsed['time'].strftime('%I:%M %p')} IST ⏰", parse_mode="Markdown")
+        return
 
-        remind_time = dateparser.parse(
-            time_text,
-            settings={
-                'PREFER_DATES_FROM': 'future',
-                'TIMEZONE': 'Asia/Kolkata',
-                'RETURN_AS_TIMEZONE_AWARE': True
-            }
-        )
-        if not remind_time:
-            bot.reply_to(message, "😅 I couldn't understand the time. Try: 'in 10 minutes' or 'at 8 pm'")
-            return
-
-        remind_time = remind_time.astimezone(IST)
-        add_reminder(message.chat.id, task, remind_time)
-        bot.reply_to(message, f"✅ Got it! I'll remind you to *{task}* at {remind_time.strftime('%I:%M %p, %b %d')} IST", parse_mode="Markdown")
-    else:
-        bot.reply_to(message, "Try saying:\n'remind me every day at 8am to meditate'\nor 'remind me to call mom at 7pm'")
+    if parsed["type"] == "one-time":
+        add_reminder(message.chat.id, parsed["task"], parsed["time"])
+        bot.reply_to(message, f"✅ Got it! I'll remind you to *{parsed['task']}* at {parsed['time'].strftime('%I:%M %p, %b %d')} IST", parse_mode="Markdown")
+        return
 
 
-# --- Background Worker Thread ---
+# === Background Thread ===
 threading.Thread(target=check_reminders, daemon=True).start()
 
-print("🤖 Bot running with recurring reminders, smart summaries, and IST timezone...")
+print("🤖 Bot running with recurring reminders, smart summaries, IST timezone, and improved parsing...")
 bot.infinity_polling()
