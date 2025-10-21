@@ -102,9 +102,19 @@ def check_reminders():
 def parse_reminder_message(text):
     """
     Returns dict with parsed info or error message
+    Uses IST as RELATIVE_BASE so 'today/tomorrow' resolve correctly.
     """
     text_orig = text.strip()
     text_l = text_orig.lower().strip()
+
+    # prepare dateparser settings with explicit RELATIVE_BASE in IST
+    relative_base = datetime.now(IST)
+    dp_settings = {
+        'PREFER_DATES_FROM': 'future',
+        'TIMEZONE': 'Asia/Kolkata',
+        'RETURN_AS_TIMEZONE_AWARE': True,
+        'RELATIVE_BASE': relative_base
+    }
 
     # Recurring reminders: "remind me every day at 8am to meditate"
     recurring_match = re.search(r"remind me every (day|daily|week|weekly) at (.+?) to (.+)", text_l)
@@ -114,10 +124,7 @@ def parse_reminder_message(text):
         time_text = recurring_match.group(2).strip()
         task = recurring_match.group(3).strip()
 
-        dt = dateparser.parse(
-            time_text,
-            settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True}
-        )
+        dt = dateparser.parse(time_text, settings=dp_settings)
         if not dt:
             return {"ok": False, "error": "😅 I couldn't understand the time in that recurring reminder. Try: 'every day at 8am'."}
         return {"ok": True, "type": "recurring", "task": task, "time": dt.astimezone(IST), "frequency": frequency}
@@ -128,12 +135,9 @@ def parse_reminder_message(text):
         task = simple_match.group(1).strip()
         time_text = simple_match.group(2).strip()
 
-        dt = dateparser.parse(
-            time_text,
-            settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True}
-        )
+        dt = dateparser.parse(time_text, settings=dp_settings)
         if not dt:
-            res = search_dates(time_text, settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True})
+            res = search_dates(time_text, settings=dp_settings)
             if res:
                 dt = res[-1][1]
         if not dt:
@@ -141,7 +145,7 @@ def parse_reminder_message(text):
         return {"ok": True, "type": "one-time", "task": task, "time": dt.astimezone(IST), "frequency": None}
 
     # Fallback: detect any datetime inside the sentence
-    res = search_dates(text_orig, settings={'PREFER_DATES_FROM': 'future', 'TIMEZONE': 'Asia/Kolkata', 'RETURN_AS_TIMEZONE_AWARE': True})
+    res = search_dates(text_orig, settings=dp_settings)
     if res:
         date_text, dt = res[-1]
         task_candidate = re.sub(re.escape(date_text), "", text_orig, flags=re.IGNORECASE).strip()
@@ -154,7 +158,6 @@ def parse_reminder_message(text):
         return {"ok": True, "type": "one-time", "task": task_candidate, "time": dt, "frequency": None}
 
     return {"ok": False, "error": "I couldn't find a time in your message. Try: 'remind me to call mom at 7pm' or 'remind me in 10 minutes'."}
-
 
 # === Telegram Handlers ===
 @bot.message_handler(commands=["start", "help"])
