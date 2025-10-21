@@ -1,3 +1,4 @@
+# reminder_bot.py
 import telebot
 import re
 import time
@@ -25,6 +26,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # === Database Helper Functions ===
 def add_reminder(chat_id, task, remind_time, recurring=False, frequency=None):
+    # Store in UTC for consistency
     utc_time = remind_time.astimezone(UTC)
     supabase.table("reminders").insert({
         "chat_id": chat_id,
@@ -98,16 +100,19 @@ def check_reminders():
         time.sleep(30)
 
 
-# === Message Parsing ===
+# === Robust Parsing with explicit RELATIVE_BASE in IST ===
 def parse_reminder_message(text):
     """
-    Returns dict with parsed info or error message
-    Uses IST as RELATIVE_BASE so 'today/tomorrow' resolve correctly.
+    Returns dict with parsed info or an error message.
+    Uses explicit RELATIVE_BASE set to current IST time so 'tomorrow' resolves correctly.
     """
+    if not text or not text.strip():
+        return {"ok": False, "error": "Empty message."}
+
     text_orig = text.strip()
     text_l = text_orig.lower().strip()
 
-    # prepare dateparser settings with explicit RELATIVE_BASE in IST
+    # Use current IST time as the reference base for relative phrases
     relative_base = datetime.now(IST)
     dp_settings = {
         'PREFER_DATES_FROM': 'future',
@@ -116,7 +121,7 @@ def parse_reminder_message(text):
         'RELATIVE_BASE': relative_base
     }
 
-    # Recurring reminders: "remind me every day at 8am to meditate"
+    # 1) Recurring reminders: "remind me every day at 8am to meditate"
     recurring_match = re.search(r"remind me every (day|daily|week|weekly) at (.+?) to (.+)", text_l)
     if recurring_match:
         freq_raw = recurring_match.group(1)
@@ -129,7 +134,7 @@ def parse_reminder_message(text):
             return {"ok": False, "error": "😅 I couldn't understand the time in that recurring reminder. Try: 'every day at 8am'."}
         return {"ok": True, "type": "recurring", "task": task, "time": dt.astimezone(IST), "frequency": frequency}
 
-    # One-time reminders: "remind me to call mom at 8 pm"
+    # 2) Straight pattern: "remind me to <task> at/in/on <time>"
     simple_match = re.search(r"remind me to (.+?) (?:at|in|on) (.+)", text_l)
     if simple_match:
         task = simple_match.group(1).strip()
@@ -144,10 +149,12 @@ def parse_reminder_message(text):
             return {"ok": False, "error": "😅 I couldn't understand the time. Try: 'in 10 minutes' or 'at 8 pm'."}
         return {"ok": True, "type": "one-time", "task": task, "time": dt.astimezone(IST), "frequency": None}
 
-    # Fallback: detect any datetime inside the sentence
+    # 3) Flexible fallback using search_dates on whole sentence
     res = search_dates(text_orig, settings=dp_settings)
     if res:
+        # pick the last detected date/time (often the intended time at the end)
         date_text, dt = res[-1]
+        # remove matched date_text from original to get the task
         task_candidate = re.sub(re.escape(date_text), "", text_orig, flags=re.IGNORECASE).strip()
         task_candidate = re.sub(r"(?i)remind me( to| that)?", "", task_candidate, flags=re.IGNORECASE).strip()
         if not task_candidate:
@@ -157,7 +164,9 @@ def parse_reminder_message(text):
         dt = dt.astimezone(IST)
         return {"ok": True, "type": "one-time", "task": task_candidate, "time": dt, "frequency": None}
 
+    # 4) If nothing matched
     return {"ok": False, "error": "I couldn't find a time in your message. Try: 'remind me to call mom at 7pm' or 'remind me in 10 minutes'."}
+
 
 # === Telegram Handlers ===
 @bot.message_handler(commands=["start", "help"])
@@ -172,7 +181,7 @@ def send_welcome(message):
         "/list today - show today's reminders\n"
         "/list week - show this week's reminders\n"
         "/delete <id> - delete a reminder by its ID\n\n"
-        "🕓 Timezone: *IST (India Standard Time)*\n"
+        "🕓 Timezone: *IST (Asia/Kolkata)*\n"
         "I'll remember and notify you at the right time!"
     ), parse_mode="Markdown")
 
@@ -230,6 +239,7 @@ def handle_message(message):
     parsed = parse_reminder_message(text)
 
     if not parsed.get("ok"):
+        # give the specific error (time missing / task missing / parse failure)
         bot.reply_to(message, parsed.get("error") + "\n\nTry:\n'remind me every day at 8am to meditate'\nor\n'remind me to call mom at 7pm'")
         return
 
@@ -247,5 +257,5 @@ def handle_message(message):
 # === Background Thread ===
 threading.Thread(target=check_reminders, daemon=True).start()
 
-print("🤖 Bot running with recurring reminders, smart summaries, IST timezone, and improved parsing...")
+print("🤖 Bot running with RELATIVE_BASE=IST, improved parsing & recurring reminders...")
 bot.infinity_polling()
