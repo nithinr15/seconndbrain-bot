@@ -1,9 +1,3 @@
-Absolutely 👍 — here’s your complete, ready-to-use README.md file for your Telegram Reminder Bot.
-
-Just copy this text into a new file named README.md inside your project folder.
-It’s formatted for GitHub (includes emojis, commands, code blocks, and setup steps).
-
-⸻
 
 🤖 Telegram Reminder Bot (Supabase + Railway + Python)
 
