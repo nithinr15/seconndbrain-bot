@@ -7,14 +7,18 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo  # Python 3.9+
 import dateparser
 from dateparser.search import search_dates
-from supabase import create_client, Client
 from calendar import monthrange
 import os
+from bot.parser import parse_reminder_message
+from bot.db import DB
 
 # === Environment Variables ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# === Initialize Database ===
+db = DB(SUPABASE_URL, SUPABASE_KEY)
 
 # === Timezone Setup ===
 IST = ZoneInfo("Asia/Kolkata")
@@ -22,7 +26,6 @@ UTC = ZoneInfo("UTC")
 
 # === Initialize Telegram and Supabase ===
 bot = telebot.TeleBot(BOT_TOKEN)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- In-memory (optional) ---
 # scheduled_timers = {}  # (not used — keeping polling approach)
@@ -57,53 +60,33 @@ def compute_next_annual_occurrence(month: int, day: int, time_of_day: str = "09:
 
 # === Database Helper Functions ===
 def add_reminder(chat_id, task, remind_time, recurring=False, frequency=None):
-    # Store in UTC for consistency
-    utc_time = remind_time.astimezone(UTC)
-    res = supabase.table("reminders").insert({
-        "chat_id": chat_id,
-        "task": task,
-        "remind_time": utc_time.isoformat(),
-        "recurring": recurring,
-        "frequency": frequency,
-        "created_at": datetime.now(UTC).isoformat()
-    }).execute()
-    print(f"💾 Saved reminder: {task} at {remind_time} IST | {utc_time} UTC")
-    return res.data[0] if res and getattr(res, "data", None) else None
+   return db.add_reminder(chat_id,task,remind_time,recurring=recurring,frequency=frequency)
 
 
 def get_due_reminders():
-    now = datetime.now(UTC).isoformat()
-    data = supabase.table("reminders").select("*").lte("remind_time", now).execute()
-    return data.data if data.data else []
-
+    return db.get_due_reminders()
+    
 
 def delete_reminder(rid):
-    supabase.table("reminders").delete().eq("id", rid).execute()
+    db.delete_reminder(rid)
     print(f"🗑️ Deleted reminder ID {rid}")
 
 
 def update_reminder_time(rid, new_time):
-    utc_time = new_time.astimezone(UTC)
-    supabase.table("reminders").update({"remind_time": utc_time.isoformat()}).eq("id", rid).execute()
+    db.update_reminder_time(rid, new_time)
     print(f"🔁 Rescheduled recurring reminder ID {rid} to {new_time} IST")
 
-
 def get_user_reminders(chat_id):
-    data = supabase.table("reminders").select("*").eq("chat_id", chat_id).order("remind_time", desc=False).execute()
-    return data.data if data.data else []
-
+    return db.get_user_reminders(chat_id)
 
 def get_user_reminders_filtered(chat_id, start, end):
-    data = (
-        supabase.table("reminders")
-        .select("*")
-        .eq("chat_id", chat_id)
-        .gte("remind_time", start.astimezone(UTC).isoformat())
-        .lte("remind_time", end.astimezone(UTC).isoformat())
-        .order("remind_time", desc=False)
-        .execute()
-    )
-    return data.data if data.data else []
+    return db.client.table("reminders") \
+        .select("*") \
+        .eq("chat_id", chat_id) \
+        .gte("remind_time", start.astimezone(UTC).isoformat()) \
+        .lte("remind_time", end.astimezone(UTC).isoformat()) \
+        .order("remind_time", desc=False) \
+        .execute().data or []
 
 
 # === Background Reminder Checker ===
